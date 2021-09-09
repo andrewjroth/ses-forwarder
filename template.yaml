@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ses-forwarder
+
+  Simple configuration to capture and forward emails to a new domain.
+
+Parameters:
+  S3BucketName:
+    Type: String
+    AllowedPattern: "^(?![-.])[.a-z0-9-]{3,63}(?<![-.])$"
+    Description: Provide the bucket name to store mail messages.
+  CreateBucketParam:
+    Type: String
+    Default: no
+    AllowedValues:
+      - yes
+      - no
+    Description: Select "yes" to create the bucket or "no" to use an existing bucket.
+  EmailDomain:
+    Type: String
+    AllowedPattern: "^((?!-)[a-z0-9-]{1,63}(?<!-)\\.)+[a-z]{2,6}$"
+    Description: Email domain that is receiving messages.
+  DestinationDomain:
+    Type: String
+    AllowedPattern: "^((?!-)[a-z0-9-]{1,63}(?<!-)\\.)+[a-z]{2,6}$"
+    Description: Email domain to foward messages to.
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 30
+    Environment:
+      Variables:
+        S3_BUCKET: !Ref S3BucketName
+        EMAIL_DOM: !Ref EmailDomain
+        DEST_DOM: !Ref DestinationDomain
+
+Conditions:
+  CreateBucket: !Equals 
+    - !Ref CreateBucketParam
+    - "yes"
+
+Resources:
+  HandleEmailFunction:
+    # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: handle_email/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt HandleEmailFunctionRole.Arn
+  HandleEmailFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref HandleEmailFunction
+      Principal: "ses.amazonaws.com"
+      SourceAccount: !Sub "${AWS::AccountId}"
+      SourceArn: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${EmailReceiptRuleSet}:receipt-rule/${AWS::StackName}-receipt-rule"
+  HandleEmailFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "ses:SendRawEmail"
+                Resource: "*"
+  EmailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Condition: CreateBucket
+    Properties: 
+      BucketName: !Ref S3BucketName
+  EmailReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties: 
+      RuleSetName: !Sub "${AWS::StackName}-receipt-rule-set"
+  EmailReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: HandleEmailFunctionPermission
+    Properties:
+      RuleSetName: !Ref EmailReceiptRuleSet
+      Rule: 
+        Name: !Sub "${AWS::StackName}-receipt-rule"
+        Enabled: yes
+        ScanEnabled: yes
+        Actions: 
+          - S3Action: 
+              BucketName: !Ref S3BucketName
+              ObjectKeyPrefix: "messages/"
+          - LambdaAction: 
+              FunctionArn: !GetAtt HandleEmailFunction.Arn
