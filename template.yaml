@@ -79,7 +79,14 @@ Resources:
             Statement:
               - Effect: "Allow"
                 Action:
+                  - "s3:ListBucket"
                   - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}/*"
+              - Effect: "Allow"
+                Action:
                   - "ses:SendRawEmail"
                 Resource: "*"
   EmailBucket:
