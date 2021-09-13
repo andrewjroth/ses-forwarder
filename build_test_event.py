@@ -17,6 +17,7 @@ S3_PREFIX_MSG = os.environ.get("S3_PREFIX") or "messages/"
 S3_PREFIX_IDX = os.environ.get("S3_PREFIX") or "index/"
 
 EVENTS_DIR = os.path.join(os.path.dirname(__file__), 'events')
+MAX_EVENTS = 3
 
 
 def list_messages():
@@ -48,6 +49,9 @@ def save_message_event(key):
     return target
 
 
-for (msg_event, msg_data) in list_messages():
+todays_messages = sorted(list_messages())
+if len(todays_messages) >= MAX_EVENTS:
+    todays_messages = todays_messages[-MAX_EVENTS:]
+for (msg_event, msg_data) in todays_messages:
     saved_filename = save_message_event(msg_event)
     print("Saved:", saved_filename)

@@ -3,7 +3,7 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   ses-forwarder
 
-  Simple configuration to capture and forward emails to a new domain.
+  Simple configuration to capture, store, and forward emails to a new domain.
 
 Parameters:
   S3BucketName:
@@ -12,10 +12,10 @@ Parameters:
     Description: Provide the bucket name to store mail messages.
   CreateBucketParam:
     Type: String
-    Default: no
+    Default: 'false'
     AllowedValues:
-      - yes
-      - no
+      - 'true'
+      - 'false'
     Description: Select "yes" to create the bucket or "no" to use an existing bucket.
   EmailDomain:
     Type: String
@@ -25,6 +25,13 @@ Parameters:
     Type: String
     AllowedPattern: "^((?!-)[a-z0-9-]{1,63}(?<!-)\\.)+[a-z]{2,6}$"
     Description: Email domain to foward messages to.
+  SetupAthenaParam:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Select "yes" to setup Athena to query the email index.
 
 # More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
 Globals:
@@ -39,7 +46,10 @@ Globals:
 Conditions:
   CreateBucket: !Equals 
     - !Ref CreateBucketParam
-    - "yes"
+    - 'true'
+  SetupAthena: !Equals
+    - !Ref SetupAthenaParam
+    - 'true'
 
 Resources:
   HandleEmailFunction:
@@ -114,3 +124,56 @@ Resources:
               ObjectKeyPrefix: "messages/"
           - LambdaAction: 
               FunctionArn: !GetAtt HandleEmailFunction.Arn
+
+  ### Setup AWS Glue and Athena ###
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    # Create an IAM role named "AWSGlueServiceRole-rolename" and attach the AWS managed policy, AWSGlueServiceRole, 
+    #   plus an inline policy that allows read access to the S3 Bucket
+    Condition: SetupAthena
+    Properties:
+      RoleName: !Sub "AWSGlueServiceRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "glue.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        -
+          PolicyName: "S3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}/*"
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Condition: SetupAthena
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "emails-${AWS::StackName}"
+        Description: !Sub "AWS Glue Database for Email Data from ${S3BucketName}"
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Condition: SetupAthena
+    Properties:
+      Name: !Sub "email-index-crawler-${AWS::StackName}"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${S3BucketName}/index/"
