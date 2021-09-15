@@ -13,16 +13,19 @@ from email.message import EmailMessage
 from datetime import datetime, timezone
 
 
-log = logging.getLogger()
-log.setLevel(logging.INFO)
-
-
+# Set environment variable "LOGLEVEL" to "DEBUG" to enable additional logging.
+LOGLEVEL = getattr(logging, os.environ.get("LOGLEVEL", "INFO").upper())
+TESTFAILURES = (False if os.environ.get("TESTFAILURES", "") in [None, "", "false"] else True)
 S3_BUCKET = os.environ.get("S3_BUCKET")
 S3_PREFIX_MSG = os.environ.get("S3_PREFIX_MSG") or "messages/"
 S3_PREFIX_IDX = os.environ.get("S3_PREFIX_IDX") or "index/"
 S3_PREFIX_ERR = os.environ.get("S3_PREFIX_ERR") or "errors/"
 EMAIL_DOM = os.environ.get("EMAIL_DOM")
 DEST_DOM = os.environ.get("DEST_DOM")
+NOTICE_TOPIC = os.environ.get("NOTICE_TOPIC")
+
+log = logging.getLogger()
+log.setLevel(LOGLEVEL)
 
 
 def transform_address(addr, user_only=False):
@@ -93,6 +96,16 @@ def save_message_error(mid, data):
         ContentType='text/plain'
     )
     return object_key
+
+
+def send_admin_notice(msg_body, msg_subj):
+    client = boto3.client('sns')
+    response = client.publish(
+        TopicArn=NOTICE_TOPIC,
+        Subject=msg_subj,
+        Message=msg_body
+    )
+    return response['MessageId']
 
 
 def forward_message(mid, recpt):
@@ -236,12 +249,13 @@ def forward_message_att(mid, recpt, subj, dry_run=False):
     # Display an error if something goes wrong.	
     except ClientError as e:
         log.error("Error Forwarding Attachment %s: <%s> %s", mid, type(e), e.response['Error']['Message'])
+        save_message_error(mid, msg.as_string())
     else:
         log.info("Email Forwarded as Attachment! Message ID: %s forwarded as %s to %s", mid, response['MessageId'], recpt)
         return response['MessageId']
 
 
-def lambda_handler(event, context):
+def handle_ses_notice(event, context):
     """Lambda function to handle inbound email from SES
     
     Action Doc:  https://docs.aws.amazon.com/ses/latest/dg/receiving-email-action-lambda.html
@@ -254,7 +268,7 @@ def lambda_handler(event, context):
         Event doc: https://docs.aws.amazon.com/ses/latest/dg/receiving-email-action-lambda-event.html
         
         Contents Details:  https://docs.aws.amazon.com/ses/latest/DeveloperGuide/receiving-email-notifications-contents.html
-        
+
         Sample Event Structure::
         
             {
@@ -263,7 +277,12 @@ def lambda_handler(event, context):
                 "eventVersion": "1.0",
                 "ses": {
                   "mail": {
-                    [...]
+                    "timestamp":"2015-09-11T20:32:33.936Z",
+                    "source":"61967230-7A45-4A9D-BEC9-87CBCF2211C9@example.com",
+                    "messageId":"d6iitobk75ur44p8kdnnp7g2n800",
+                    "destination":[
+                      "recipient@example.com"
+                    ],
                   },
                   "receipt": {
                     "timestamp": "2019-08-05T21:30:02.028Z",
@@ -329,7 +348,134 @@ def lambda_handler(event, context):
                 log.info("Message %s Result: Failed DMARC with reject policy", message_id)
                 continue
         
+        # Fail for testing
+        if TESTFAILURES:
+            log.error("Testing Failures, Message Not Forwarded: %s", message_id)
+            raise Exception("Test Failure for %s" % (message_id,))
+        
         message_subj = "[FWD] " + ses_notification['mail']['commonHeaders']['subject']
         message_recp = [ "@".join([e.split("@")[0], DEST_DOM]) for e in ses_notification['receipt']['recipients'] ]
         result = forward_message(message_id, message_recp)
 
+
+def handle_dead_letter(event, context):
+    """Lambda function to handle the "Dead Letter" queue
+    
+    To test, configure environment variable TESTFAILURES for ses notice function.
+    
+    Parameters
+    ----------
+    event: dict, required
+        SES Input Format or SNS with SES Input Format
+
+        Event doc: https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html
+        
+        Lambda DLQ Details:  https://docs.aws.amazon.com/lambda/latest/dg/invocation-async.html#invocation-dlq
+        
+        Dead-letter queue message attributes:
+
+            * RequestID (String) – The ID of the invocation request. Request IDs appear in function logs.
+            * ErrorCode (Number) – The HTTP status code.
+            * ErrorMessage (String) – The first 1 KB of the error message.
+        
+        By default, as many as 10 records may be sent at one time.
+        
+        Sample SQS Event Structure::
+        
+            {
+                "Records": [
+                    {
+                        "eventSource": "aws:sqs",
+                        "eventSourceARN": "arn:aws:sqs:us-east-2:123456789012:my-queue",
+                        "messageId": "059f36b4-87a3-44ab-83d2-661975830a7d",
+                        "receiptHandle": "AQEBwJnKyrHigUMZj6rYigCgxlaS3SLy0a...",
+                        "body": "<json-encoded string of SES event>",
+                        "attributes": {
+                            "ApproximateReceiveCount": "1",
+                            "SentTimestamp": "1545082649183",
+                            "SenderId": "AIDAIENQZJOLO23YVJ4VO",
+                            "ApproximateFirstReceiveTimestamp": "1545082649185"
+                        },
+                        "messageAttributes": {
+                            "RequestID": "2b733gdc-8ac3-cdf5-af3a-1827b3b11284",
+                            "ErrorCode": "200",
+                            "ErrorMessage": "This is the log entry of the error message"
+                        },
+                        "md5OfBody": "e4e68fb7bd0e697a0ae8f1bb342846b3",
+                        "awsRegion": "us-east-1"
+                    },
+                    [...]
+                ]
+            }
+
+    context: object, required
+        Lambda Context runtime methods and attributes
+
+        Context doc: https://docs.aws.amazon.com/lambda/latest/dg/python-context-object.html
+
+    """
+    for record in event['Records']:
+        if record['eventSource'] != "aws:sqs":
+            log.error("Unknown Event Source: %s", record['eventSource'])
+            log.error("Event Record: %s", record)
+            continue
+        # sqs_message_id = record["messageId"]
+        failed_req_id = record['messageAttributes']['RequestID']
+        failed_event = json.loads(record['body'])  # Decode JSON String body
+        log.info("Processing Failed Request ID: %s", failed_req_id)
+        log.debug("Failed Request ID %s Record: %s", failed_req_id, failed_event)
+        for failed_record in failed_event['Records']:
+            if failed_record['eventSource'] != "aws:ses":
+                log.error("Unknown Event Source: %s", failed_record['eventSource'])
+                log.error("Event Record: %s", failed_record)
+                continue
+            ses_notification = failed_record['ses']
+            log.debug("SES Notification: %s", ses_notification)
+            # Start Processing
+            message_id = ses_notification['mail']['messageId'] # Used as S3 Key for message
+            log.info("Processing Message ID: %s", message_id)
+            mail = ses_notification['mail']
+            # "mail": { "timestamp":"2015-09-11T20:32:33.936Z", "source":"user@example.com", 
+            #           "messageId":"d6iitobk75ur44p8kdnnp7g2n800", "destination":[ "recipient@example.com" ] }
+            log.info("Message Failure Details: %s", {
+                "messageId": mail['messageId'],
+                "timestamp": mail['timestamp'],
+                "source": mail['source'],
+                "destination": mail['destination']
+            })
+            
+            ts = datetime.strptime(mail['timestamp'], "%Y-%m-%dT%H:%M:%S.%fZ")  # "timestamp":"2015-09-11T20:32:33.936Z",
+            source = transform_address(mail['source'], user_only=True)
+            dest_list = ", ".join(mail['destination'])
+
+            error_notice_body = "\n".join([
+                "Hello Admin,",
+                "",
+                "The applicaiton failed to forward a message.", 
+                "",
+                "Here are the message details:",
+                f"  Message ID: {mail['messageId']}",
+                f"  Timestamp: {mail['timestamp']}",
+                f"  Sender: {mail['source']}",
+                f"  Destination:  {dest_list}",
+                "",
+                "The original message should be available here:", 
+                f"s3://{S3_BUCKET}/{S3_PREFIX_MSG}{mail['messageId']}",
+                "  Note:  raw message can be downloaded and viewed in a text viewer or adding the '.eml' extention prompt it to open in an email client",
+                "",
+                "If saved, the notification from SES might be available here:", 
+                f"s3://{S3_BUCKET}/{S3_PREFIX_IDX}{ts:%Y/%m/%d}/{ts:%Y%m%dT%H%M%S}_{source}_{message_id}.json",
+                "",
+                "If the failure occured during sending, the failed message to be sent might be available here:", 
+                f"s3://{S3_BUCKET}/{S3_PREFIX_ERR}{ts:%Y/%m/%d}/{ts:%Y%m%d}THHMMSS_{message_id}.eml (timestamp may be different)",
+                "",
+                "Please investigate this failure.",
+                "",
+                "Thank you,",
+                "SES Forwarder",
+                "",
+                "Failed Record:",
+                json.dumps({"Records": [failed_record]})
+            ])
+            notice_msg_id = send_admin_notice(error_notice_body, "Failed Message Delivery: %s" % (mail['messageId'],))
+            log.info("Sent Notice to Admin: %s", notice_msg_id)

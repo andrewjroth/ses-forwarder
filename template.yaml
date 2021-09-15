@@ -3,20 +3,24 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   ses-forwarder
 
-  Simple configuration to capture, store, and forward emails to a new domain.
+  Simple application to capture, store, and forward emails to a new domain.
 
 Parameters:
   S3BucketName:
     Type: String
     AllowedPattern: "^(?![-.])[.a-z0-9-]{3,63}(?<![-.])$"
-    Description: Provide the bucket name to store mail messages.
+    Description: Provide the bucket name to store mail messages, index data, and errors.
   CreateBucketParam:
     Type: String
     Default: 'false'
     AllowedValues:
       - 'true'
       - 'false'
-    Description: Select "yes" to create the bucket or "no" to use an existing bucket.
+    Description: Select "true" to create the bucket or "false" to use an existing bucket.
+  SNSTopicParam:
+    Type: String
+    Default: ""
+    Description: Provide an SNS Topic ARN to use an existing SNS Topic.  Leave blank to create the topic.
   EmailDomain:
     Type: String
     AllowedPattern: "^((?!-)[a-z0-9-]{1,63}(?<!-)\\.)+[a-z]{2,6}$"
@@ -31,7 +35,7 @@ Parameters:
     AllowedValues:
       - 'true'
       - 'false'
-    Description: Select "yes" to setup Athena to query the email index.
+    Description: Select "true" to setup AWS Glue support using Athena to query the email index.
 
 # More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
 Globals:
@@ -39,14 +43,20 @@ Globals:
     Timeout: 30
     Environment:
       Variables:
+        LOGLEVEL: "INFO"
+        TESTFAILURES: ""
         S3_BUCKET: !Ref S3BucketName
         EMAIL_DOM: !Ref EmailDomain
         DEST_DOM: !Ref DestinationDomain
+        NOTICE_TOPIC: !If [ CreateTopic, !Ref AdminNoticeTopic, !Ref SNSTopicParam ]
 
 Conditions:
   CreateBucket: !Equals 
     - !Ref CreateBucketParam
     - 'true'
+  CreateTopic: !Equals
+    - !Ref SNSTopicParam
+    - ''
   SetupAthena: !Equals
     - !Ref SetupAthenaParam
     - 'true'
@@ -57,9 +67,12 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: handle_email/
-      Handler: app.lambda_handler
+      Handler: app.handle_ses_notice
       Runtime: python3.8
       Role: !GetAtt HandleEmailFunctionRole.Arn
+      DeadLetterQueue:
+        Type: 'SQS'
+        TargetArn: !GetAtt HandleEmailDeadLetterQueue.Arn
   HandleEmailFunctionPermission:
     Type: AWS::Lambda::Permission
     Properties: 
@@ -99,12 +112,107 @@ Resources:
                 Action:
                   - "ses:SendRawEmail"
                 Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "sqs:SendMessage"
+                  - "sqs:ReceiveMessage"
+                  - "sqs:DeleteMessage"
+                  - "sqs:GetQueueAttributes"
+                Resource: !GetAtt HandleEmailDeadLetterQueue.Arn
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: !If [ CreateTopic, !Ref AdminNoticeTopic, !Ref SNSTopicParam ]
+  HandleEmailFunctionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: 
+      AlarmName: SES Forwarder Mail Handle Error
+      AlarmDescription: An error occured with the Lambda function handling email for SES Forwarder
+      Namespace: AWS/Lambda
+      Dimensions: 
+        - Name: FunctionName
+          Value: !Ref HandleEmailFunction
+      MetricName: Errors
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: Sum
+      Threshold: 1
+      Unit: Count
+      AlarmActions: 
+        - !If [ CreateTopic, !Ref AdminNoticeTopic, !Ref SNSTopicParam ]
+      OKActions: 
+        - !If [ CreateTopic, !Ref AdminNoticeTopic, !Ref SNSTopicParam ]
+      TreatMissingData: notBreaching
+  HandleEmailDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties: # Max Message Size is 256 KiB
+      # MessageRetentionPeriod in seconds from 60 (1 m) to 1,209,600 (14 days); Default is 4 days (345,600 s)
+      MessageRetentionPeriod: 604800  # 7 days
+  HandleEmailDeadLetterFunction:
+    # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: handle_email/
+      Handler: app.handle_dead_letter
+      Runtime: python3.8
+      Role: !GetAtt HandleEmailFunctionRole.Arn
+      Events:
+        HandleEmailDeadLetterQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt HandleEmailDeadLetterQueue.Arn
+  HandleEmailDeadLetterFunctionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: 
+      AlarmName: SES Forwarder Dead Letter Error
+      AlarmDescription: An error occured with the Lambda function handling message errors for SES Forwarder
+      Namespace: AWS/Lambda
+      Dimensions: 
+        - Name: FunctionName
+          Value: !Ref HandleEmailDeadLetterFunction
+      MetricName: Errors
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: Sum
+      Threshold: 1
+      Unit: Count
+      AlarmActions: 
+        - !If [ CreateTopic, !Ref AdminNoticeTopic, !Ref SNSTopicParam ]
+      OKActions: 
+        - !If [ CreateTopic, !Ref AdminNoticeTopic, !Ref SNSTopicParam ]
+      TreatMissingData: notBreaching
+  AdminNoticeTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateTopic
+    Properties: 
+      TopicName: !Sub "${AWS::StackName}-admin-notice"
   EmailBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Condition: CreateBucket
     Properties: 
       BucketName: !Ref S3BucketName
+  EmailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Condition: CreateBucket
+    Properties: 
+      Bucket: !Ref S3BucketName
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Sid: "AllowSESPuts"
+            Effect: "Allow"
+            Principal: {"Service":"ses.amazonaws.com"}
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}/*"
+            Condition:
+              StringEquals:
+                aws:Referer: !Sub ${AWS::AccountId}
   EmailReceiptRuleSet:
     Type: AWS::SES::ReceiptRuleSet
     Properties: 
@@ -122,10 +230,10 @@ Resources:
           - S3Action: 
               BucketName: !Ref S3BucketName
               ObjectKeyPrefix: "messages/"
-          - LambdaAction: 
+          - LambdaAction: # The default invocation type is Event (invoked asynchronously).
               FunctionArn: !GetAtt HandleEmailFunction.Arn
 
-  ### Setup AWS Glue and Athena ###
+  ### Setup AWS Glue ###
   GlueServiceRole:
     Type: AWS::IAM::Role
     # Create an IAM role named "AWSGlueServiceRole-rolename" and attach the AWS managed policy, AWSGlueServiceRole, 
@@ -174,6 +282,64 @@ Resources:
       Name: !Sub "email-index-crawler-${AWS::StackName}"
       Role: !GetAtt GlueServiceRole.Arn
       DatabaseName: !Ref GlueDatabase
+      ScheduleExpression: "cron(0 0 * * ? *)"
       Targets:
         S3Targets:
           - Path: !Sub "s3://${S3BucketName}/index/"
+
+Outputs:
+  00Instructions:
+    Value: !Sub "https://console.aws.amazon.com/sesv2/home?region=${AWS::Region}#/email-receiving"
+    Description: >
+      After deployment is complete, be sure to activate the SES Rule Set.
+      Only one rule set can be active at a time and this step must be done manually.
+  01SESRuleSetName:
+    Value: !Sub "${AWS::StackName}-receipt-rule-set"
+    Description: >
+      This is the SES Rule Set Name created by this stack.
+      After deployment is complete, be sure to activate the SES Rule Set.
+      Only one rule set can be active at a time and this step must be done manually.
+  02EmailBucket:
+    Value: !Ref S3BucketName
+    Description: >
+      Email data, including raw messages, index, and errors, are stored in this S3 bucket.
+  20AdminTopicLink:
+    Condition: CreateTopic
+    Value: !Sub "https://console.aws.amazon.com/sns/v3/home?region=${AWS::Region}#/topic/${AdminNoticeTopic}"
+    Description: >
+      Be sure to add subscribers to the SNS Topic for Admin Notices such as failures
+  40GlueDatabaseName:
+    Condition: SetupAthena
+    Value: !Sub "emails-${AWS::StackName}"
+    Description: >
+      This is the name of the AWS Glue Database to use from Athena.
+      Before using Athena, run the crawler.
+  41GlueCrawlerLink:
+    Condition: SetupAthena
+    Value: !Sub "https://console.aws.amazon.com/glue/home?region=${AWS::Region}#crawler:name=email-index-crawler-${AWS::StackName}"
+    Description: >
+      This is a link to the AWS Glue Crawler.  
+      After emails have been processed, run the crawler to create the table in the AWS Glue Database.
+      This must be done before AWS Athena can be used to query the data.
+  ###
+  HandleEmailFunction:
+    Value: !Ref HandleEmailFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-HandleEmailFunction"
+  HandleEmailDeadLetterQueue:
+    Value: !Ref HandleEmailDeadLetterQueue
+    Export:
+      Name: !Sub "${AWS::StackName}-HandleEmailDeadLetterQueue"
+  HandleEmailDeadLetterFunction:
+    Value: !Ref HandleEmailDeadLetterFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-HandleEmailDeadLetterFunction"
+  EmailReceiptRule:
+    Value: !Ref EmailReceiptRule
+    Export:
+      Name: !Sub "${AWS::StackName}-EmailReceiptRule"
+  S3BucketName:
+    Value: !Ref S3BucketName
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketName"
+  
