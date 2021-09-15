@@ -282,7 +282,8 @@ Resources:
       Name: !Sub "email-index-crawler-${AWS::StackName}"
       Role: !GetAtt GlueServiceRole.Arn
       DatabaseName: !Ref GlueDatabase
-      ScheduleExpression: "cron(0 0 * * ? *)"
+      Schedule:
+        ScheduleExpression: "cron(0 0 * * ? *)"
       Targets:
         S3Targets:
           - Path: !Sub "s3://${S3BucketName}/index/"

@@ -12,7 +12,7 @@ Logs from the Lambda Function are automatically captured by CloudWatch Logs.
 A cooresponding CloudWatch Logs group is created on the first execution.
 
 If using an existing S3 Bucket, be sure the S3 Bucket Policy allows SES to write objects.
-See [Sample S3 Bucket Policy for SES](ses-bucket-policy.json)
+See [Sample S3 Bucket Policy for SES](ses-bucket-policy.json).
 
 ![Diagram](ses-forwarder-diagram.png)
 
