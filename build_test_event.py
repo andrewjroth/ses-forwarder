@@ -34,7 +34,7 @@ def list_messages():
 
 def save_message_event(key):
     ''' Download the event path provided by key and save in the EVENTS_DIR folder. '''
-    target = os.path.join(EVENTS_DIR, key.replace("/", "_"))
+    target = os.path.join(EVENTS_DIR, os.path.basename(key))
     client = boto3.client('s3')
     response = client.get_object(Bucket=S3_BUCKET, Key=key)
     event = {
