@@ -3,7 +3,8 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   ses-forwarder
 
-  Simple application to capture, store, and forward emails to a new domain.
+  Simple application to capture, store, and forward emails to a new domain using 
+  Amazon Simple Email Service (SES) for receiving and sending of email.
 
 Parameters:
   S3BucketName:
@@ -44,7 +45,6 @@ Globals:
     Environment:
       Variables:
         LOGLEVEL: "INFO"
-        TESTFAILURES: ""
         S3_BUCKET: !Ref S3BucketName
         EMAIL_DOM: !Ref EmailDomain
         DEST_DOM: !Ref DestinationDomain
@@ -63,7 +63,7 @@ Conditions:
 
 Resources:
   HandleEmailFunction:
-    # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    # More info about Function Resource: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: handle_email/
@@ -150,7 +150,7 @@ Resources:
       # MessageRetentionPeriod in seconds from 60 (1 m) to 1,209,600 (14 days); Default is 4 days (345,600 s)
       MessageRetentionPeriod: 604800  # 7 days
   HandleEmailDeadLetterFunction:
-    # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    # More info about Function Resource: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: handle_email/
@@ -162,6 +162,7 @@ Resources:
           Type: SQS
           Properties:
             Queue: !GetAtt HandleEmailDeadLetterQueue.Arn
+            MaximumBatchingWindowInSeconds: 60 # 5 Minutes (300 s) is the maximum; default is 0
   HandleEmailDeadLetterFunctionAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties: 
@@ -273,7 +274,7 @@ Resources:
     Properties:
       CatalogId: !Ref AWS::AccountId
       DatabaseInput:
-        Name: !Sub "emails-${AWS::StackName}"
+        Name: !Sub "email-${AWS::StackName}"
         Description: !Sub "AWS Glue Database for Email Data from ${S3BucketName}"
   GlueCrawler:
     Type: AWS::Glue::Crawler
@@ -311,7 +312,7 @@ Outputs:
       Be sure to add subscribers to the SNS Topic for Admin Notices such as failures
   40GlueDatabaseName:
     Condition: SetupAthena
-    Value: !Sub "emails-${AWS::StackName}"
+    Value: !Sub "email-${AWS::StackName}"
     Description: >
       This is the name of the AWS Glue Database to use from Athena.
       Before using Athena, run the crawler.
